@@ -1,7 +1,9 @@
 import argparse
 import json
 import math
+import os
 import random
+import shutil
 import threading
 import platform
 import socket 
@@ -41,10 +43,23 @@ LAFUFU_ESPEAK_VOICE = "en-us"
 LAFUFU_PYTTSX3_KEYWORDS = ("child", "kid", "young", "girl", "boy", "zira", "hazel", "aria", "jenny")
 
 # ------------------ Piper TTS (offline) ------------------
-PIPER_MODEL_DEFAULT = "models/en_US-libritts_r-medium.onnx"
-PIPER_CONFIG_DEFAULT = "models/en_US-libritts_r-medium.onnx.json"
+_IS_WINDOWS = platform.system().lower() == "windows"
+PIPER_MODEL_DEFAULT = (
+    "models/en_US-libritts-high.onnx"
+    if _IS_WINDOWS
+    else "models/en_US-libritts_r-medium.onnx"
+)
+PIPER_CONFIG_DEFAULT = PIPER_MODEL_DEFAULT + ".json"
 PIPER_MODEL_CANDIDATES = (
+    "models/en_US-libritts-high.onnx",
     "models/en_US-libritts_r-medium.onnx",
+    "models/en_US-libritts-medium.onnx",
+    "models/en_US-libritts-low.onnx",
+) if _IS_WINDOWS else (
+    "models/en_US-libritts_r-medium.onnx",
+    "models/en_US-libritts-medium.onnx",
+    "models/en_US-libritts-high.onnx",
+    "models/en_US-libritts-low.onnx",
 )
 PIPER_SPEAKER_DEFAULT = 0
 PIPER_LENGTH_SCALE_DEFAULT = 0.9  # slightly faster speech by default
@@ -941,6 +956,17 @@ def _ollama_chat(payload: dict, timeout: int = 300):
     )
     return urlopen(req, timeout=timeout)
 
+def _ollama_chat_collect_non_stream(payload: dict, timeout: int = 300) -> str:
+    payload = dict(payload)
+    payload["stream"] = False
+    try:
+        with _ollama_chat(payload, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="ignore")
+        obj = json.loads(data) if data else {}
+        return ((obj.get("message") or {}).get("content") or "").strip()
+    except Exception:
+        return ""
+
 def warmup_qwen(model: str, system_prompt: str, keep_alive=None) -> None:
     payload = {
         "model": model,
@@ -1005,11 +1031,13 @@ def ask_qwen_stream_collect(prompt: str, model: str, system_prompt: str = None, 
                 if obj.get("done", False):
                     break
 
+        if not full:
+            return _ollama_chat_collect_non_stream(payload, timeout=300)
         return "".join(full).strip()
     except URLError:
-        return ""
+        return _ollama_chat_collect_non_stream(payload, timeout=300)
     except Exception:
-        return ""
+        return _ollama_chat_collect_non_stream(payload, timeout=300)
 
 def parse_emotion_and_spoken_text(reply: str):
     if not reply:
@@ -1420,7 +1448,9 @@ def _piper_tts_to_wav(tts_config: dict, text: str, out_wav: Path) -> bool:
     if noise_w is not None:
         cmd.extend(["--noise_w", str(float(noise_w))])
 
-    subprocess.run(cmd, input=text.encode("utf-8"), check=False)
+    env = os.environ.copy()
+    env.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")
+    subprocess.run(cmd, input=text.encode("utf-8"), check=False, env=env)
     _apply_pitch_shift(out_wav, float(tts_config.get("piper_pitch_cents") or 0.0))
     return out_wav.exists() and out_wav.stat().st_size > 44
 
@@ -1495,6 +1525,13 @@ def play_wav_plain(wav_path: Path) -> None:
     if not wav_path.exists():
         return
 
+    if platform.system().lower() == "linux":
+        aplay_path = shutil.which("aplay")
+        if aplay_path:
+            result = subprocess.run([aplay_path, "-q", str(wav_path)], check=False)
+            if result.returncode == 0:
+                return
+
     wf = wave.open(str(wav_path), "rb")
     channels = wf.getnchannels()
     sample_width = wf.getsampwidth()
@@ -1529,6 +1566,12 @@ def play_wav_plain(wav_path: Path) -> None:
 def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
     if not wav_path.exists():
         return
+
+    if platform.system().lower() == "linux":
+        aplay_path = shutil.which("aplay")
+        if aplay_path:
+            subprocess.run([aplay_path, "-q", str(wav_path)], check=False)
+            return
 
     _idle_suspend()
     try:
