@@ -1450,7 +1450,14 @@ def _piper_tts_to_wav(tts_config: dict, text: str, out_wav: Path) -> bool:
 
     env = os.environ.copy()
     env.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")
-    subprocess.run(cmd, input=text.encode("utf-8"), check=False, env=env)
+    subprocess.run(
+        cmd,
+        input=text.encode("utf-8"),
+        check=False,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     _apply_pitch_shift(out_wav, float(tts_config.get("piper_pitch_cents") or 0.0))
     return out_wav.exists() and out_wav.stat().st_size > 44
 
@@ -1521,14 +1528,25 @@ def render_tts_to_wav(tts_config: dict, text: str, out_wav: Path) -> bool:
     except Exception:
         return False
 
+def _aplay_cmd(wav_path: Path):
+    aplay_path = shutil.which("aplay")
+    if not aplay_path:
+        return None
+    cmd = [aplay_path, "-q"]
+    device = os.environ.get("LAFUFU_APLAY_DEVICE")
+    if device:
+        cmd.extend(["-D", device])
+    cmd.append(str(wav_path))
+    return cmd
+
 def play_wav_plain(wav_path: Path) -> None:
     if not wav_path.exists():
         return
 
     if platform.system().lower() == "linux":
-        aplay_path = shutil.which("aplay")
-        if aplay_path:
-            result = subprocess.run([aplay_path, "-q", str(wav_path)], check=False)
+        cmd = _aplay_cmd(wav_path)
+        if cmd:
+            result = subprocess.run(cmd, check=False)
             if result.returncode == 0:
                 return
 
@@ -1568,9 +1586,9 @@ def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
         return
 
     if platform.system().lower() == "linux":
-        aplay_path = shutil.which("aplay")
-        if aplay_path:
-            subprocess.run([aplay_path, "-q", str(wav_path)], check=False)
+        cmd = _aplay_cmd(wav_path)
+        if cmd:
+            subprocess.run(cmd, check=False)
             return
 
     _idle_suspend()
