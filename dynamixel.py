@@ -4,9 +4,10 @@ import math
 import os
 import random
 import shutil
+import signal
 import threading
 import platform
-import socket 
+import socket
 import subprocess
 import sys
 import time
@@ -359,6 +360,27 @@ class StatusLine:
         sys.stdout.flush()
 
 _status = StatusLine()
+
+# Suppress ALSA/JACK stderr spam during PyAudio init on Linux
+def _quiet_pyaudio():
+    """Create a PyAudio instance with stderr suppressed."""
+    devnull = None
+    old_fd = None
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_fd = os.dup(2)
+        os.dup2(devnull, 2)
+    except OSError:
+        pass
+    try:
+        p = pyaudio.PyAudio()
+    finally:
+        if old_fd is not None:
+            os.dup2(old_fd, 2)
+            os.close(old_fd)
+        if devnull is not None:
+            os.close(devnull)
+    return p
 
 def chat_print(s: str = "", end: str = "\n") -> None:
     _status.suspend_for_chat()
@@ -878,7 +900,7 @@ def record_until_silence() -> Path:
     _eye_set_target(EYE_IDLE_DXL)
     _brow_set_target(BROW_IDLE_DXL)
 
-    p = pyaudio.PyAudio()
+    p = _quiet_pyaudio()
     stream = p.open(
         format=FORMAT,
         channels=CHANNELS,
@@ -1562,7 +1584,7 @@ def play_wav_plain(wav_path: Path) -> None:
             subprocess.run(["aplay", str(wav_path)], check=False)
         return
 
-    p = pyaudio.PyAudio()
+    p = _quiet_pyaudio()
     stream = p.open(
         format=pa_fmt,
         channels=channels,
@@ -1585,12 +1607,6 @@ def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
     if not wav_path.exists():
         return
 
-    if platform.system().lower() == "linux":
-        cmd = _aplay_cmd(wav_path)
-        if cmd:
-            subprocess.run(cmd, check=False)
-            return
-
     _idle_suspend()
     try:
         wf = wave.open(str(wav_path), "rb")
@@ -1599,11 +1615,6 @@ def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
         framerate = wf.getframerate()
 
         pa_fmt = pa_format_from_sample_width(sample_width)
-        if pa_fmt is None:
-            wf.close()
-            if platform.system().lower() == "linux":
-                subprocess.run(["aplay", str(wav_path)], check=False)
-            return
 
         fps = max(5, int(LIPSYNC_FPS))
         chunk_frames = max(1, int(framerate / fps))
@@ -1616,9 +1627,9 @@ def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
                 break
             chunks.append(data)
             rms_vals.append(rms_from_bytes(data, sample_width))
+        wf.close()
 
         if not chunks:
-            wf.close()
             return
 
         vals_sorted = sorted(rms_vals)
@@ -1630,25 +1641,51 @@ def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
         attack_coeff = 1.0 - math.exp(-dt / max(1e-6, LIPSYNC_ATTACK_S))
         release_coeff = 1.0 - math.exp(-dt / max(1e-6, LIPSYNC_RELEASE_S))
 
-        p = pyaudio.PyAudio()
-        stream = p.open(
-            format=pa_fmt,
-            channels=channels,
-            rate=framerate,
-            output=True,
-            frames_per_buffer=chunk_frames,
-        )
-
         env = 0.0
         jaw_range = float(MOUTH_OPEN_DXL - MOUTH_CLOSE_DXL)
         last_jaw_dxl = float(MOUTH_CLOSE_DXL)
 
         _head_set_target(HEAD_IDLE_LR_DXL, HEAD_IDLE_UD_DXL)
 
+        # Start audio playback — aplay in background on Linux, PyAudio otherwise
+        use_aplay = False
+        aplay_proc = None
+        pa_stream = None
+        pa_inst = None
+
+        if platform.system().lower() == "linux":
+            aplay_cmd = _aplay_cmd(wav_path)
+            if aplay_cmd:
+                aplay_proc = subprocess.Popen(
+                    aplay_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                use_aplay = True
+
+        if not use_aplay:
+            if pa_fmt is None:
+                if platform.system().lower() == "linux":
+                    subprocess.run(["aplay", str(wav_path)], check=False)
+                return
+            pa_inst = _quiet_pyaudio()
+            pa_stream = pa_inst.open(
+                format=pa_fmt,
+                channels=channels,
+                rate=framerate,
+                output=True,
+                frames_per_buffer=chunk_frames,
+            )
+
         t0 = time.time()
         try:
             for i, data in enumerate(chunks):
-                stream.write(data)
+                if use_aplay:
+                    # Pace motor updates by wall-clock to stay in sync with aplay
+                    target_t = t0 + (i + 1) * dt
+                    now = time.time()
+                    if target_t > now:
+                        time.sleep(target_t - now)
+                else:
+                    pa_stream.write(data)
 
                 _head_step(dt)
 
@@ -1683,10 +1720,13 @@ def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
                 _status.update_if_changed(*vals)
 
         finally:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-            wf.close()
+            if pa_stream:
+                pa_stream.stop_stream()
+                pa_stream.close()
+            if pa_inst:
+                pa_inst.terminate()
+            if aplay_proc:
+                aplay_proc.wait()
 
             _smooth_return_to_neutral(last_jaw_dxl)
     finally:
@@ -1706,6 +1746,13 @@ def main() -> int:
     global _head_lr_cur, _head_ud_cur, _head_lr_tgt, _head_ud_tgt
     global _eye_cur, _eye_tgt, _brow_cur, _brow_tgt
     global _idle_show_status
+    global SILENCE_THRESHOLD
+
+    # Suppress noisy library warnings (onnxruntime, whisper FP16, torch, etc.)
+    import warnings
+    warnings.filterwarnings("ignore")
+    os.environ.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")
+    os.environ.setdefault("PYTHONWARNINGS", "ignore")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", "-a", type=Path)
@@ -1729,6 +1776,7 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--no-lipsync", action="store_true")
     parser.add_argument("--no-printer", action="store_true", help="Disable printing Lafufu replies.")
+    parser.add_argument("--silence-threshold", type=int, default=SILENCE_THRESHOLD, help="RMS threshold for voice activity detection (default 800). Raise if ambient noise causes false triggers.")
 
     # sim vs real
     parser.add_argument("--sim", action="store_true", help="Simulator only (no Dynamixel). Still sends UDP to Blender.")
@@ -1743,6 +1791,9 @@ def main() -> int:
     parser.add_argument("--leave-torque", action="store_true", help="Do not torque-disable on exit.")
     args = parser.parse_args()
     _idle_show_status = not args.text_input
+
+    # Apply configurable silence threshold
+    SILENCE_THRESHOLD = args.silence_threshold
 
     # Blender settings
     if args.no_blender:
@@ -1792,6 +1843,16 @@ def main() -> int:
     else:
         _dxl_bus = None
         chat_print("SIM mode: no Dynamixel output (UDP only).")
+
+    # Register signal handlers so torque is disabled on SIGTERM / Ctrl+C
+    def _shutdown_handler(signum, _frame):
+        chat_print("\n⚡ Signal received, disabling torque...")
+        if _dxl_bus is not None:
+            _dxl_bus.close()
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
 
     # seed pose
     vals = _send_pose_outputs(seed_jaw_dxl, _head_lr_cur, _head_ud_cur, _eye_cur, _brow_cur)
