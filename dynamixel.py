@@ -904,11 +904,19 @@ def record_until_silence() -> Path:
     _brow_set_target(BROW_IDLE_DXL)
 
     p = _quiet_pyaudio()
+    # Find the Shure mic (44100 Hz) — avoid Jabra mic (16000 Hz)
+    input_device = None
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info["maxInputChannels"] > 0 and "shure" in info["name"].lower():
+            input_device = i
+            break
     stream = p.open(
         format=FORMAT,
         channels=CHANNELS,
         rate=RATE,
         input=True,
+        input_device_index=input_device,
         frames_per_buffer=CHUNK,
     )
 
