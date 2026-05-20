@@ -67,8 +67,15 @@ PIPER_NOISE_SCALE_DEFAULT = 0.667
 PIPER_NOISE_W_DEFAULT = 0.8
 PIPER_PITCH_CENTS_DEFAULT = 0.0  # disable pitch shifting by default for speed
 
+SUPERTONIC_VOICE_DEFAULT = "F3"
+SUPERTONIC_LANG_DEFAULT = "en"
+SUPERTONIC_STEPS_DEFAULT = 5
+SUPERTONIC_SPEED_DEFAULT = 1.0
+
+_supertonic_tts = None
+
 # ------------------ Qwen model & system prompt ------------------
-QWEN_MODEL = "qwen2.5:7b"
+QWEN_MODEL = "qwen2.5:0.5b"
 SYSTEM_PROMPT = (
     "You are Lafufu, a mischievous and playful humanoid creature. Reply in no more than 20 words. "
     "Always output an \"[emotion]\" where emotion is one of: happy, sad, angry, surprised, neutral, agree, disagree. "
@@ -1494,9 +1501,33 @@ def _piper_tts_to_wav(tts_config: dict, text: str, out_wav: Path) -> bool:
     _apply_pitch_shift(out_wav, float(tts_config.get("piper_pitch_cents") or 0.0))
     return out_wav.exists() and out_wav.stat().st_size > 44
 
+def _supertonic_tts_to_wav(tts_config: dict, text: str, out_wav: Path) -> bool:
+    global _supertonic_tts
+    try:
+        if _supertonic_tts is None:
+            from supertonic import TTS
+
+            _supertonic_tts = TTS(
+                model_dir=Path(__file__).parent / "models/supertonic-3",
+                auto_download=False,
+            )
+        voice = (tts_config.get("supertonic_voice") or SUPERTONIC_VOICE_DEFAULT).strip()
+        style = _supertonic_tts.get_voice_style(voice)
+        wav, _ = _supertonic_tts.synthesize(
+            text,
+            voice_style=style,
+            lang=(tts_config.get("supertonic_lang") or SUPERTONIC_LANG_DEFAULT).strip(),
+            total_steps=int(tts_config.get("supertonic_steps", SUPERTONIC_STEPS_DEFAULT)),
+            speed=float(tts_config.get("supertonic_speed", SUPERTONIC_SPEED_DEFAULT)),
+        )
+        _supertonic_tts.save_audio(wav, str(out_wav))
+    except Exception:
+        return False
+    return out_wav.exists() and out_wav.stat().st_size > 44
+
 def speak(tts_config: dict, text: str) -> None:
     engine = tts_config.get("engine", "pyttsx3")
-    if engine == "piper":
+    if engine in ("piper", "supertonic"):
         out_wav = Path(TTS_WAV_FILENAME)
         ok = render_tts_to_wav(tts_config, text, out_wav)
         if ok:
@@ -1534,6 +1565,9 @@ def render_tts_to_wav(tts_config: dict, text: str, out_wav: Path) -> bool:
 
     if engine == "piper":
         return _piper_tts_to_wav(tts_config, text, out_wav)
+
+    if engine == "supertonic":
+        return _supertonic_tts_to_wav(tts_config, text, out_wav)
 
     if engine == "espeak":
         rate, volume, voice, pitch = _resolve_tts_params(engine, tts_config)
@@ -1840,7 +1874,7 @@ def main() -> int:
     parser.add_argument("--tts-rate", type=int, default=170)
     parser.add_argument("--tts-volume", type=float, default=1.0)
     parser.add_argument("--tts-voice", default=LAFUFU_VOICE_PRESET)
-    parser.add_argument("--tts-engine", choices=["piper", "auto", "pyttsx3", "espeak"], default="piper")
+    parser.add_argument("--tts-engine", choices=["piper", "supertonic", "auto", "pyttsx3", "espeak"], default="piper")
     parser.add_argument("--piper-model", default="", help="Piper model path. Empty = auto-select fastest available.")
     parser.add_argument("--piper-config", default="", help="Piper config path. Empty = auto from model.")
     parser.add_argument("--piper-speaker", type=int, default=PIPER_SPEAKER_DEFAULT)
@@ -1848,6 +1882,10 @@ def main() -> int:
     parser.add_argument("--piper-noise-scale", type=float, default=PIPER_NOISE_SCALE_DEFAULT)
     parser.add_argument("--piper-noise-w", type=float, default=PIPER_NOISE_W_DEFAULT)
     parser.add_argument("--piper-pitch", type=float, default=PIPER_PITCH_CENTS_DEFAULT, help="Pitch shift cents via librosa (0 disables).")
+    parser.add_argument("--supertonic-voice", default=SUPERTONIC_VOICE_DEFAULT, help="Voice M1–M5 or F1–F5.")
+    parser.add_argument("--supertonic-lang", default=SUPERTONIC_LANG_DEFAULT, help="Language code (en, ko, na, …).")
+    parser.add_argument("--supertonic-steps", type=int, default=SUPERTONIC_STEPS_DEFAULT, help="Quality steps 5–12.")
+    parser.add_argument("--supertonic-speed", type=float, default=SUPERTONIC_SPEED_DEFAULT, help="Speed 0.7–2.0.")
     parser.add_argument("--system-prompt", type=str, default=None, help="Override the system prompt sent to Qwen.")
     parser.add_argument("--text-input", action="store_true")
     parser.add_argument("--once", action="store_true")
@@ -2009,7 +2047,13 @@ def main() -> int:
                 "piper_noise_w": args.piper_noise_w,
                 "piper_pitch_cents": args.piper_pitch,
             })
-
+        elif tts_config.get("engine") == "supertonic":
+            tts_config.update({
+                "supertonic_voice": args.supertonic_voice,
+                "supertonic_lang": args.supertonic_lang,
+                "supertonic_steps": args.supertonic_steps,
+                "supertonic_speed": args.supertonic_speed,
+            })
     try:
         while True:
             if args.text_input:
